@@ -1,0 +1,7 @@
+##Bibliotecas usadas
+
+opencv-python
+numpy
+scipy
+matplotlib
+pillow

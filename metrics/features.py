@@ -1,0 +1,1 @@
+# Calcula centro, raio, área, perímetro e circularidade de cada cratera.

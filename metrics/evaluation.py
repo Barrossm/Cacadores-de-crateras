@@ -1,0 +1,1 @@
+# Avalia o resultado contra o ground truth: IoU, precisão, recall e tempo de execução.

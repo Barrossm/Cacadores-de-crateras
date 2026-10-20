@@ -1,0 +1,1 @@
+# Reduz o ruído com um filtro Gaussiano antes da detecção de bordas.

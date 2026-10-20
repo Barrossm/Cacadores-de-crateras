@@ -1,0 +1,1 @@
+# Melhora o contraste local da imagem usando CLAHE.

@@ -1,0 +1,1 @@
+# Interface Tkinter: carrega uma imagem, roda o pipeline e desenha as crateras nela.

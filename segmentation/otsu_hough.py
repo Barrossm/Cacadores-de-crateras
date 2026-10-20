@@ -1,0 +1,1 @@
+# Binariza com Otsu e detecta crateras circulares com a Transformada de Hough.

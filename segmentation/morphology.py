@@ -1,0 +1,1 @@
+# Limpa a máscara binária com abertura e fechamento (elemento estruturante em disco).

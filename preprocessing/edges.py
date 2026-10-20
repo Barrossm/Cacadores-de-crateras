@@ -1,0 +1,1 @@
+# Detecta bordas com Sobel e Laplaciano.
