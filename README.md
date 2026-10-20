@@ -81,8 +81,6 @@ python gui.py
 2. O pipeline roda e as crateras aparecem desenhadas sobre a imagem original.
 3. As medidas de cada cratera aparecem ao lado.
 
-```
-
 ## Dados
 
 Imagens públicas da câmera **LROC**, da sonda _Lunar Reconnaissance Orbiter_ (NASA), obtidas no [Planetary Data System](https://pds-imaging.jpl.nasa.gov/). Usamos recortes de 256 a 512 px de lado, em escala de cinza de 8 bits.
