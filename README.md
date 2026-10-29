@@ -102,7 +102,7 @@ Para testar, coloque imagens em `Imagens_entrada/`. De onde vieram e como foi fe
 - [ ] `preprocessing/smoothing.py`: filtro Gaussiano
 - [ ] `preprocessing/edges.py`: Sobel e Laplaciano
 - [ ] `segmentation/morphology.py`: abertura e fechamento
-- [ ] `segmentation/otsu_hough.py`: Otsu + Hough
+- [x] `segmentation/otsu_hough.py`: Otsu + Hough
 - [ ] `metrics/features.py`: descrição geométrica das crateras
 - [ ] `metrics/evaluation.py`: IoU, precisão, recall e tempo
 - [ ] `gui.py`: interface gráfica
