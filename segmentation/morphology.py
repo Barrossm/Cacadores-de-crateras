@@ -20,6 +20,12 @@ def _validate_kernel_size(kernel_size: int) -> int:
     return int(kernel_size)
 
 
+def _validate_iterations(iterations: int) -> int:
+    if not isinstance(iterations, (int, np.integer)) or iterations < 1:
+        raise ValueError("O número de iterações deve ser um inteiro positivo.")
+    return int(iterations)
+
+
 def create_disk(kernel_size: int = 5) -> np.ndarray:
     """Cria um elemento estruturante circular com tamanho ímpar."""
     size = _validate_kernel_size(kernel_size)
@@ -28,8 +34,7 @@ def create_disk(kernel_size: int = 5) -> np.ndarray:
 
 def opening(mask: np.ndarray, kernel_size: int = 5, iterations: int = 1) -> np.ndarray:
     """Aplica erosão seguida de dilatação para remover pequenos ruídos."""
-    if iterations < 1:
-        raise ValueError("O número de iterações deve ser positivo.")
+    iterations = _validate_iterations(iterations)
     return cv2.morphologyEx(
         _validate_mask(mask),
         cv2.MORPH_OPEN,
@@ -40,8 +45,7 @@ def opening(mask: np.ndarray, kernel_size: int = 5, iterations: int = 1) -> np.n
 
 def closing(mask: np.ndarray, kernel_size: int = 5, iterations: int = 1) -> np.ndarray:
     """Aplica dilatação seguida de erosão para fechar pequenas falhas."""
-    if iterations < 1:
-        raise ValueError("O número de iterações deve ser positivo.")
+    iterations = _validate_iterations(iterations)
     return cv2.morphologyEx(
         _validate_mask(mask),
         cv2.MORPH_CLOSE,
