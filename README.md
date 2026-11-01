@@ -42,6 +42,7 @@ Cacadores-de-crateras/
 ├── gui.py                  # interface gráfica (ponto de entrada)
 ├── preprocessing/          # contraste, suavização e bordas
 │   ├── __init__.py
+│   ├── acquisition.py      # leitura e conversão para escala de cinza
 │   ├── contrast.py
 │   ├── smoothing.py
 │   └── edges.py
@@ -98,6 +99,7 @@ Para testar, coloque imagens em `Imagens_entrada/`. De onde vieram e como foi fe
 ## Roadmap
 
 - [x] Estrutura do repositório
+- [x] `preprocessing/acquisition.py`: leitura e conversão para escala de cinza
 - [ ] `preprocessing/contrast.py`: CLAHE
 - [ ] `preprocessing/smoothing.py`: filtro Gaussiano
 - [ ] `preprocessing/edges.py`: Sobel e Laplaciano
