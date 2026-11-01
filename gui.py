@@ -18,6 +18,8 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageDraw, ImageTk
 
+from preprocessing.acquisition import load_grayscale_image
+
 # ----------------------------------------------------------------------------
 # Identidade visual
 # ----------------------------------------------------------------------------
@@ -288,8 +290,8 @@ def importar_imagem():
         return
 
     try:
-        gray = Image.open(path).convert("L")
-    except Exception as exc:
+        gray = load_grayscale_image(path)
+    except (OSError, ValueError) as exc:
         messagebox.showerror("Imagem inválida", f"Não foi possível abrir o arquivo.\n\n{exc}")
         return
 
