@@ -4,19 +4,29 @@ gui.py - Interface gráfica do projeto (Tkinter + Pillow).
 COMO O PROGRAMA FUNCIONA
     Tela 1 (inicial):    céu com estrelas, Lua e foguete. O botão DECOLAR
                          faz o foguete subir e leva para a Tela 2.
-    Tela 2 (análise):    o usuário importa uma imagem da Lua, o pipeline real
-                         roda (Aquisição -> CLAHE/Gaussiano -> Otsu + Morfologia
-                         + Hough Multi-Faixa + Validação Radial -> Features)
-                         e as crateras aparecem desenhadas na imagem, com o
-                         relatório (resumo + tabela) ao lado.
+    Tela 2 (análise):    o usuário importa uma imagem da Lua e o pipeline real
+                         roda integrando os módulos de todos os integrantes:
+                           1. Aquisição (preprocessing/acquisition.py)
+                           2. Contraste CLAHE (preprocessing/contrast.py)
+                           3. Suavização Gaussiana (preprocessing/smoothing.py)
+                           4. Bordas Sobel + Laplaciano + Limiar por Histerese (preprocessing/edges.py)
+                           5. Morfologia com Disco: abertura/fechamento/clean (segmentation/morphology.py)
+                           6. Segmentação Otsu + Hough Multi-Faixa + Validação Radial
+                           7. Descrição Geométrica: centro, raio, área, perímetro, circularidade (metrics/features.py)
     Janela de Avaliação: compara as crateras detectadas com o Ground Truth
-                         (gabarito em CSV ou marcado na própria tela com o mouse),
-                         mostrando visualmente os Acertos (TP), Falsos Alarmes (FP)
-                         e Esquecidas (FN), além de dizer se a Precisão, o Recall
-                         e o IoU foram bons.
+                         usando metrics/evaluation.py, mostrando visualmente os
+                         Acertos (TP), Falsos Alarmes (FP) e Esquecidas (FN),
+                         além de dizer se a Precisão, o Recall e o IoU foram bons.
 """
 import random
+import sys
 import time
+from pathlib import Path
+
+
+_PREPROC_DIR = str(Path(__file__).resolve().parent / "preprocessing")
+if _PREPROC_DIR not in sys.path:
+    sys.path.insert(0, _PREPROC_DIR)
 
 try:
     import tkinter as tk
@@ -54,7 +64,7 @@ FONT = "Helvetica"
 
 USING_DEMO_PIPELINE = False
 
-# Parâmetros padrão ajustáveis na barra da Tela 2 (escala de trabalho de 750 px)
+# Parâmetros padrão ajustáveis na barra da Tela 2 (escala de trabalho de 760 px)
 HOUGH_PARAMS = {
     "min_dist": 24,
     "param1": 90,
@@ -85,7 +95,7 @@ MOON_DECOR = [
 ]
 
 # ----------------------------------------------------------------------------
-# Estado global
+# Estado global e cache de pré-processamento
 # ----------------------------------------------------------------------------
 estado = {
     "gray": None,         # imagem PIL original em escala de cinza ("L")
@@ -98,43 +108,95 @@ estado = {
     "ground_truth": [],   # lista de tuplas (x, y, r) do gabarito atual
     "last_eval": None,    # último resultado de evaluation.evaluate(...)
 }
+_preproc_cache = {
+    "key": None,
+    "data": None,
+}
 ui = {}      # widgets: botões, canvas, tabela, resumo
 telas = {}   # frames: "inicial" e "analise"
 root = None  # inicializado em main()
 
 
 # ----------------------------------------------------------------------------
-# Lógica (sem interface): pipeline real integrado com os módulos do grupo
+# Lógica (sem interface): pipeline real integrado com os módulos de todo o grupo
 # ----------------------------------------------------------------------------
-def _run_optional_preprocessing(img: np.ndarray) -> np.ndarray:
-    """Roda as etapas de pré-processamento (CLAHE + Filtro Gaussiano)."""
-    work = img.copy()
+def _run_team_preprocessing(work_img: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Executa os módulos de pré-processamento:
+      - Etapa 2: contrast.clahe (equalização adaptativa de histograma)
+      - Etapa 3: smoothing.gaussian_blur (suavização Gaussiana por convolução 2D)
+      - Etapa 4: edges.sobel, edges.laplacian e edges.threshold_edges (detecção de bordas)
+    Guarda o resultado em cache para que o botão 'Recalcular' responda instantaneamente.
+    """
+    cache_key = (work_img.shape, int(work_img.sum()), int(work_img[0, 0]), int(work_img[-1, -1]))
+    if _preproc_cache["key"] == cache_key and _preproc_cache["data"] is not None:
+        return _preproc_cache["data"]
 
-    if hasattr(contrast, "apply_clahe"):
-        work = contrast.apply_clahe(work)
+    # 1. Melhoria de contraste usando preprocessing/contrast.py
+    # Como contrast.clahe usa laços for em Python pixel a pixel, para imagens maiores que 320 px
+    # calcula o mapa de ganho local do contrast.clahe em 320 px (~0.5s em vez de 12s) e aplica na imagem.
+    if hasattr(contrast, "clahe"):
+        h_w, w_w = work_img.shape
+        if max(h_w, w_w) > 320:
+            s_c = 320.0 / max(h_w, w_w)
+            small = cv2.resize(work_img, (max(16, int(w_w * s_c)), max(16, int(h_w * s_c))), interpolation=cv2.INTER_AREA)
+            small_clahe = contrast.clahe(small, clip_limit=2.0, tile_grid=(8, 8)).astype(np.float32)
+            gain = (small_clahe + 1.0) / (small.astype(np.float32) + 1.0)
+            gain_full = cv2.resize(gain, (w_w, h_w), interpolation=cv2.INTER_LINEAR)
+            enhanced = np.clip(np.rint(work_img.astype(np.float32) * gain_full), 0, 255).astype(np.uint8)
+        else:
+            enhanced = contrast.clahe(work_img, clip_limit=2.0, tile_grid=(8, 8))
+    elif hasattr(contrast, "apply_clahe"):
+        enhanced = contrast.apply_clahe(work_img)
     else:
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        work = clahe.apply(work)
+        clahe_cv = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe_cv.apply(work_img)
 
+    # 2. Suavização Gaussiana usando preprocessing/smoothing.py
     if hasattr(smoothing, "gaussian_blur"):
-        work = smoothing.gaussian_blur(work)
+        blur_f = np.asarray(smoothing.gaussian_blur(enhanced, sigma=1.0), dtype=np.float32)
+        blur_u8 = np.clip(np.rint(blur_f), 0, 255).astype(np.uint8)
     else:
-        work = cv2.GaussianBlur(work, (5, 5), 1.0)
+        blur_u8 = cv2.GaussianBlur(enhanced, (5, 5), 1.0)
+        blur_f = blur_u8.astype(np.float32)
 
-    return work
+    # 3. Detecção de bordas usando preprocessing/edges.py (Sobel + Laplaciano + Limiarização)
+    if hasattr(edges, "sobel") and hasattr(edges, "laplacian"):
+        sobel_mag = np.asarray(edges.sobel(blur_f), dtype=np.float32)
+        lap_mag = np.asarray(edges.laplacian(blur_f), dtype=np.float32)
+        grad = sobel_mag + 0.25 * lap_mag
+        if hasattr(edges, "threshold_edges"):
+            edge_binary = edges.threshold_edges(sobel_mag, low_pct=88, high_pct=96)
+        else:
+            edge_binary = (sobel_mag >= np.percentile(sobel_mag, 90)).astype(np.uint8) * 255
+    else:
+        gx_s = cv2.Sobel(blur_f, cv2.CV_32F, 1, 0, ksize=3)
+        gy_s = cv2.Sobel(blur_f, cv2.CV_32F, 0, 1, ksize=3)
+        grad = np.hypot(gx_s, gy_s)
+        edge_binary = (grad >= np.percentile(grad, 90)).astype(np.uint8) * 255
+
+    result = (blur_u8, blur_f, grad, edge_binary)
+    _preproc_cache["key"] = cache_key
+    _preproc_cache["data"] = result
+    return result
 
 
 def _build_cohesive_crater_mask(
     blurred: np.ndarray,
+    edge_binary: np.ndarray,
     circles_work: list[tuple[int, int, int]],
 ) -> np.ndarray:
-    """Gera a máscara binária combinando Otsu + Morfologia com disco (módulo do grupo),
-    e garante que cada cratera forme uma região conexa para medir área e circularidade.
+    """Gera a máscara binária combinando Otsu + Bordas (preprocessing/edges.py) +
+    Morfologia com disco (segmentation/morphology.py), garantindo que cada cratera
+    forme uma região conexa para medir área, perímetro e circularidade.
     """
     _, mask_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     med = float(np.median(blurred))
     std = float(np.std(blurred))
-    anom = (np.abs(blurred.astype(np.float32) - med) > max(15.0, 0.38 * std)) | (mask_otsu == 0)
+    anom = (
+        (np.abs(blurred.astype(np.float32) - med) > max(15.0, 0.38 * std))
+        | (mask_otsu == 0)
+        | (edge_binary > 0)
+    )
 
     cleaned = morphology.closing(
         morphology.clean(anom, kernel_size=5, iterations=1),
@@ -169,16 +231,11 @@ def _build_cohesive_crater_mask(
 def run_pipeline(gray: Image.Image, params: dict | None = None) -> list[dict]:
     """Recebe uma imagem PIL em escala de cinza ("L") e devolve a lista de crateras.
 
-    Corrige o problema de círculos gigantes do HoughCircle:
-      1. Pré-processamento com CLAHE + Filtro Gaussiano e cálculo de bordas com Sobel.
-      2. Geração de candidatos por Bacias Escuras (Otsu + Limiar Adaptativo + morphology.opening)
-         e por Transformada de Hough dividida em faixas estreitas de raio (para que raios
-         grandes não roubem os votos das crateras pequenas e médias).
-      3. Validação radial vetorizada em NumPy: verifica se o candidato tem interior escuro
-         (0.30r..0.55r) e salto para a borda iluminada exatamente em 0.95r..1.10r.
-      4. Pós-refinamento de halo: se um círculo grande estiver envolvendo o halo escuro
-         externo de uma cratera menor bem definida no centro, trava no anel interno real.
-      5. Extração geométrica via metrics/features.py (centro, raio, área, perímetro, circularidade).
+    Integra todos os módulos desenvolvidos:
+      1. Pré-processamento: contrast.clahe -> smoothing.gaussian_blur -> edges.sobel + edges.laplacian + edges.threshold_edges.
+      2. Segmentação: Otsu + Limiar Adaptativo + morphology.opening/closing/clean + Transformada de Hough em faixas de raio.
+      3. Validação radial vetorizada em NumPy e pós-refinamento de halo.
+      4. Descrição geométrica: features.describe_craters (centro, raio, área, perímetro e circularidade).
     """
     cfg = dict(HOUGH_PARAMS)
     if params:
@@ -187,8 +244,6 @@ def run_pipeline(gray: Image.Image, params: dict | None = None) -> list[dict]:
     orig_img = np.array(gray, dtype=np.uint8)
     orig_h, orig_w = orig_img.shape
 
-    # Trabalha em resolução de até 760 px no maior lado para preservar crateras pequenas
-    # com nitidez e manter o tempo de execução rápido (~400 ms)
     max_side = max(orig_h, orig_w)
     scale = 760.0 / max_side if max_side > 760 else 1.0
     if scale < 1.0:
@@ -198,19 +253,13 @@ def run_pipeline(gray: Image.Image, params: dict | None = None) -> list[dict]:
     else:
         work_img = orig_img.copy()
 
-    blur = _run_optional_preprocessing(work_img)
-    blur_f = blur.astype(np.float32)
-
-    # Detecção de bordas (Sobel) para medir a força da parede circular da cratera
-    gx_s = cv2.Sobel(blur_f, cv2.CV_32F, 1, 0, ksize=3)
-    gy_s = cv2.Sobel(blur_f, cv2.CV_32F, 0, 1, ksize=3)
-    grad = np.hypot(gx_s, gy_s)
+    # Roda os módulos de pré-processamento (CLAHE, Gaussiano, Sobel e Laplaciano)
+    blur, blur_f, grad, edge_binary = _run_team_preprocessing(work_img)
 
     r_min_cfg = max(6, int(cfg["min_radius"]))
     r_max_cfg = max(r_min_cfg + 6, int(cfg["max_radius"]))
     param2_cfg = max(10, int(cfg["param2"]))
 
-    # Grade de deduplicação rápida de candidatos (cx, cy, r)
     cand_grid: dict[tuple[int, int, int], tuple[float, float, float]] = {}
 
     def add_cand(cx: float, cy: float, r: float) -> None:
@@ -234,7 +283,7 @@ def run_pipeline(gray: Image.Image, params: dict | None = None) -> list[dict]:
                 (cx, cy), rad = cv2.minEnclosingCircle(c)
                 add_cand(cx, cy, rad)
 
-    # 2. Candidatos via Limiar Adaptativo Local + Morfologia (acha crateras em regiões claras ou escuras)
+    # 2. Candidatos via Limiar Adaptativo Local + Morfologia
     for bsz in (25, 45, 75, 115):
         for cval in (14, 24, 34):
             ad = cv2.adaptiveThreshold(
@@ -248,7 +297,7 @@ def run_pipeline(gray: Image.Image, params: dict | None = None) -> list[dict]:
                 (cx, cy), rad = cv2.minEnclosingCircle(c)
                 add_cand(cx, cy, rad)
 
-    # 3. Transformada de Hough em faixas estreitas de raio (impede que raios grandes dominem)
+    # 3. Transformada de Hough em faixas estreitas de raio
     band_edges = np.linspace(r_min_cfg, r_max_cfg, 5).astype(int)
     for b_idx in range(4):
         b_min = int(band_edges[b_idx])
@@ -271,7 +320,7 @@ def run_pipeline(gray: Image.Image, params: dict | None = None) -> list[dict]:
     if not cand_grid:
         return []
 
-    # 4. Avaliação Radial Vetorizada em NumPy para todos os candidatos de uma vez só
+    # 4. Avaliação Radial Vetorizada em NumPy usando o mapa de bordas (Sobel + Laplaciano)
     cands_arr = np.array(list(cand_grid.values()), dtype=np.float32)
     cx_v, cy_v, r_v = cands_arr[:, 0:1], cands_arr[:, 1:2], cands_arr[:, 2:3]
 
@@ -302,7 +351,6 @@ def run_pipeline(gray: Image.Image, params: dict | None = None) -> list[dict]:
     rim_jump_frac = np.mean((v_rim - v_floor) > 16.0, axis=1)
     grad_score = np.mean(g_rim, axis=1)
 
-    # Trava o raio na transição exata entre o interior escuro (0.72r) e a crista clara (0.95r)
     early_bright_pen = np.maximum(0.0, (mean_72 - mean_floor) - 0.55 * (mean_rim - mean_floor)) * 3.0
     center_bright_pen = np.maximum(0.0, np.mean(v30, axis=1) - 90.0) * 2.0
 
@@ -315,7 +363,6 @@ def run_pipeline(gray: Image.Image, params: dict | None = None) -> list[dict]:
         - center_bright_pen
     ) * (rim_jump_frac ** 1.5)
 
-    # O controle PARAM2 (Exigência) ajusta o limiar de confiança e o limite de detecções
     min_score_thresh = 55.0 + (param2_cfg - 20) * 1.8
     max_detections = max(12, int(round(82 - param2_cfg)))
 
@@ -347,8 +394,7 @@ def run_pipeline(gray: Image.Image, params: dict | None = None) -> list[dict]:
     if not selected:
         return []
 
-    # 5. Pós-refinamento de halo: se um círculo grande estiver envolvendo um cone escuro externo
-    # que já possui a crista branca da cratera menor bem definida no centro, trava no anel interno!
+    # 5. Pós-refinamento de halo
     refined_work_circles: list[tuple[int, int, int]] = []
     for cx, cy, r in selected:
         best_r = r
@@ -366,8 +412,8 @@ def run_pipeline(gray: Image.Image, params: dict | None = None) -> list[dict]:
                     break
         refined_work_circles.append((cx, cy, best_r))
 
-    # 6. Constrói a máscara morfológica e extrai os atributos geométricos com metrics/features.py
-    mask_work = _build_cohesive_crater_mask(blur, refined_work_circles)
+    # 6. Constrói a máscara morfológica e extrai atributos geométricos com metrics/features.py
+    mask_work = _build_cohesive_crater_mask(blur, edge_binary, refined_work_circles)
     work_circles_arr = np.array(refined_work_circles, dtype=np.float32)
     craters_work = features.describe_craters(mask_work, work_circles_arr)
 
@@ -932,7 +978,7 @@ def abrir_janela_avaliacao():
     tk.Label(
         help_box,
         text=(
-            "• Ground Truth (Gabarito): crateras reais marcadas por você.\n"
+            "• Ground Truth (Gabarito): crateras reais marcadas.\n"
             "• IoU (Interseção sobre União): % de encaixe entre o círculo detectado e o real.\n"
             "• Precisão: das crateras marcadas pelo programa, quantas eram reais?\n"
             "• Recall: das crateras reais que existem, quantas o programa achou?"
