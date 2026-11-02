@@ -5,7 +5,8 @@ COMO O PROGRAMA FUNCIONA
     Tela 1 (inicial):    céu com estrelas, Lua e foguete. O botão DECOLAR
                          faz o foguete subir e leva para a Tela 2.
     Tela 2 (análise):    o usuário importa uma imagem da Lua, o pipeline real
-                         roda (Aquisição -> Otsu -> Morfologia -> Hough -> Features)
+                         roda (Aquisição -> CLAHE/Gaussiano -> Otsu + Morfologia
+                         + Hough Multi-Faixa + Validação Radial -> Features)
                          e as crateras aparecem desenhadas na imagem, com o
                          relatório (resumo + tabela) ao lado.
     Janela de Avaliação: compara as crateras detectadas com o Ground Truth
@@ -14,7 +15,6 @@ COMO O PROGRAMA FUNCIONA
                          e Esquecidas (FN), além de dizer se a Precisão, o Recall
                          e o IoU foram bons.
 """
-import math
 import random
 import time
 
@@ -52,16 +52,16 @@ GREEN = "#3ddc84"
 RED = "#ff5c77"
 FONT = "Helvetica"
 
-
 USING_DEMO_PIPELINE = False
 
-# Parâmetros padrão da Transformada de Hough
+# Parâmetros padrão ajustáveis na barra da Tela 2 (escala de trabalho de 750 px)
 HOUGH_PARAMS = {
-    "min_dist": 30,
-    "param1": 50,
-    "param2": 22,
-    "min_radius": 10,
-    "max_radius": 60,
+    "min_dist": 24,
+    "param1": 90,
+    "param2": 36,       # Exigência (maior = mais rigoroso / menos falsos alarmes)
+    "min_radius": 11,
+    "max_radius": 55,
+    "min_circularity": 0.35,
 }
 
 # Colunas da tabela: (chave, título, largura)
@@ -74,7 +74,7 @@ COLUMNS = [
     ("circ", "Circularidade", 100),
 ]
 
-# Crateras decorativas da Lua: (dx, dy, raio)
+# Crateras decorativas da Lua: (dx, dy, raio) como fração do raio da Lua.
 MOON_DECOR = [
     (-0.35, -0.93, 0.05),
     (0.15, -0.88, 0.07),
@@ -104,90 +104,303 @@ root = None  # inicializado em main()
 
 
 # ----------------------------------------------------------------------------
-# Lógica (sem interface): pré-processamento, pipeline real, desenho de crateras e resumo
+# Lógica (sem interface): pipeline real integrado com os módulos do grupo
 # ----------------------------------------------------------------------------
 def _run_optional_preprocessing(img: np.ndarray) -> np.ndarray:
-    
+    """Roda as etapas de pré-processamento (CLAHE + Filtro Gaussiano)."""
     work = img.copy()
 
-    # 1. Melhoria de contraste (CLAHE)
     if hasattr(contrast, "apply_clahe"):
         work = contrast.apply_clahe(work)
     else:
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         work = clahe.apply(work)
 
-    # 2. Suavização (Filtro Gaussiano)
     if hasattr(smoothing, "gaussian_blur"):
         work = smoothing.gaussian_blur(work)
     else:
-        work = cv2.GaussianBlur(work, (5, 5), 1.2)
+        work = cv2.GaussianBlur(work, (5, 5), 1.0)
 
     return work
+
+
+def _build_cohesive_crater_mask(
+    blurred: np.ndarray,
+    circles_work: list[tuple[int, int, int]],
+) -> np.ndarray:
+    """Gera a máscara binária combinando Otsu + Morfologia com disco (módulo do grupo),
+    e garante que cada cratera forme uma região conexa para medir área e circularidade.
+    """
+    _, mask_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    med = float(np.median(blurred))
+    std = float(np.std(blurred))
+    anom = (np.abs(blurred.astype(np.float32) - med) > max(15.0, 0.38 * std)) | (mask_otsu == 0)
+
+    cleaned = morphology.closing(
+        morphology.clean(anom, kernel_size=5, iterations=1),
+        kernel_size=7,
+        iterations=1,
+    )
+
+    h, w = cleaned.shape
+    final_mask = np.zeros((h, w), dtype=np.uint8)
+    for cx, cy, r in circles_work:
+        x0, x1 = max(0, cx - r - 2), min(w, cx + r + 3)
+        y0, y1 = max(0, cy - r - 2), min(h, cy + r + 3)
+
+        sub_clean = cleaned[y0:y1, x0:x1].astype(np.uint8)
+        circle_patch = np.zeros_like(sub_clean)
+        cv2.circle(circle_patch, (cx - x0, cy - y0), r, 1, thickness=-1)
+        inter = (sub_clean & circle_patch) * 255
+
+        contours, _ = cv2.findContours(inter, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest) >= 0.18 * np.pi * (r ** 2):
+                hull = cv2.convexHull(largest)
+                cv2.drawContours(final_mask[y0:y1, x0:x1], [hull], -1, 1, thickness=-1)
+                continue
+
+        cv2.circle(final_mask, (cx, cy), r, 1, thickness=-1)
+
+    return final_mask.astype(bool)
 
 
 def run_pipeline(gray: Image.Image, params: dict | None = None) -> list[dict]:
     """Recebe uma imagem PIL em escala de cinza ("L") e devolve a lista de crateras.
 
-    Conecta diretamente os códigos que o grupo já fez:
-      1. Pré-processamento (CLAHE + Suavização Gaussiana)
-      2. Limiarização de Otsu (como em segmentation/otsu_hough.py)
-      3. Morfologia Matemática: abertura + fechamento com disco (segmentation/morphology.py)
-      4. Transformada de Hough para círculos (como em segmentation/otsu_hough.py)
-      5. Descrição Geométrica: centro, raio, área, perímetro e circularidade (metrics/features.py)
+    Corrige o problema de círculos gigantes do HoughCircle:
+      1. Pré-processamento com CLAHE + Filtro Gaussiano e cálculo de bordas com Sobel.
+      2. Geração de candidatos por Bacias Escuras (Otsu + Limiar Adaptativo + morphology.opening)
+         e por Transformada de Hough dividida em faixas estreitas de raio (para que raios
+         grandes não roubem os votos das crateras pequenas e médias).
+      3. Validação radial vetorizada em NumPy: verifica se o candidato tem interior escuro
+         (0.30r..0.55r) e salto para a borda iluminada exatamente em 0.95r..1.10r.
+      4. Pós-refinamento de halo: se um círculo grande estiver envolvendo o halo escuro
+         externo de uma cratera menor bem definida no centro, trava no anel interno real.
+      5. Extração geométrica via metrics/features.py (centro, raio, área, perímetro, circularidade).
     """
     cfg = dict(HOUGH_PARAMS)
     if params:
         cfg.update(params)
 
-    img = np.array(gray, dtype=np.uint8)
-    preprocessed = _run_optional_preprocessing(img)
+    orig_img = np.array(gray, dtype=np.uint8)
+    orig_h, orig_w = orig_img.shape
 
-    # Limiarização de Otsu para gerar a máscara binária
-    _, mask_otsu = cv2.threshold(
-        preprocessed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
+    # Trabalha em resolução de até 760 px no maior lado para preservar crateras pequenas
+    # com nitidez e manter o tempo de execução rápido (~400 ms)
+    max_side = max(orig_h, orig_w)
+    scale = 760.0 / max_side if max_side > 760 else 1.0
+    if scale < 1.0:
+        work_w = max(32, int(round(orig_w * scale)))
+        work_h = max(32, int(round(orig_h * scale)))
+        work_img = cv2.resize(orig_img, (work_w, work_h), interpolation=cv2.INTER_AREA)
+    else:
+        work_img = orig_img.copy()
 
-    # Limpeza morfológica feita pelo módulo segmentation/morphology.py do grupo
-    mask_clean = morphology.clean(mask_otsu > 0, kernel_size=5, iterations=1)
+    blur = _run_optional_preprocessing(work_img)
+    blur_f = blur.astype(np.float32)
 
-    # Se edges.py tiver uma função pronta, pode auxiliar; para o HoughCircles,
-    # usamos a imagem pré-processada (que evita os falsos positivos do binário puro)
-    circles = cv2.HoughCircles(
-        preprocessed,
-        cv2.HOUGH_GRADIENT,
-        dp=1,
-        minDist=int(cfg["min_dist"]),
-        param1=int(cfg["param1"]),
-        param2=int(cfg["param2"]),
-        minRadius=int(cfg["min_radius"]),
-        maxRadius=int(cfg["max_radius"]),
-    )
+    # Detecção de bordas (Sobel) para medir a força da parede circular da cratera
+    gx_s = cv2.Sobel(blur_f, cv2.CV_32F, 1, 0, ksize=3)
+    gy_s = cv2.Sobel(blur_f, cv2.CV_32F, 0, 1, ksize=3)
+    grad = np.hypot(gx_s, gy_s)
 
-    if circles is None:
+    r_min_cfg = max(6, int(cfg["min_radius"]))
+    r_max_cfg = max(r_min_cfg + 6, int(cfg["max_radius"]))
+    param2_cfg = max(10, int(cfg["param2"]))
+
+    # Grade de deduplicação rápida de candidatos (cx, cy, r)
+    cand_grid: dict[tuple[int, int, int], tuple[float, float, float]] = {}
+
+    def add_cand(cx: float, cy: float, r: float) -> None:
+        for rf in (0.85, 0.92, 1.0, 1.08):
+            rr = r * rf
+            if r_min_cfg <= rr <= r_max_cfg:
+                key = (int(round(cx)) // 4, int(round(cy)) // 4, int(round(rr)) // 2)
+                if key not in cand_grid:
+                    cand_grid[key] = (float(cx), float(cy), float(rr))
+
+    # 1. Candidatos via Limiar de Otsu + Morfologia com disco (segmentation/morphology.py)
+    otsu_t, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    for tf in (0.45, 0.60, 0.75, 0.90, 1.05):
+        dark = blur < (otsu_t * tf)
+        for ksz in (3, 5):
+            cl = morphology.opening(dark, kernel_size=ksz, iterations=1)
+            cnts, _ = cv2.findContours(cl.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in cnts:
+                if cv2.contourArea(c) < 25:
+                    continue
+                (cx, cy), rad = cv2.minEnclosingCircle(c)
+                add_cand(cx, cy, rad)
+
+    # 2. Candidatos via Limiar Adaptativo Local + Morfologia (acha crateras em regiões claras ou escuras)
+    for bsz in (25, 45, 75, 115):
+        for cval in (14, 24, 34):
+            ad = cv2.adaptiveThreshold(
+                blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, bsz, cval
+            )
+            cl = morphology.opening(ad > 0, kernel_size=3, iterations=1)
+            cnts, _ = cv2.findContours(cl.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in cnts:
+                if cv2.contourArea(c) < 25:
+                    continue
+                (cx, cy), rad = cv2.minEnclosingCircle(c)
+                add_cand(cx, cy, rad)
+
+    # 3. Transformada de Hough em faixas estreitas de raio (impede que raios grandes dominem)
+    band_edges = np.linspace(r_min_cfg, r_max_cfg, 5).astype(int)
+    for b_idx in range(4):
+        b_min = int(band_edges[b_idx])
+        b_max = max(b_min + 4, int(band_edges[b_idx + 1]))
+        b_p2 = max(12, int(round(param2_cfg * (0.42 + 0.06 * b_idx))))
+        hc = cv2.HoughCircles(
+            blur,
+            cv2.HOUGH_GRADIENT,
+            dp=1.0,
+            minDist=max(10, int(b_min * 0.8)),
+            param1=max(30, int(cfg["param1"])),
+            param2=b_p2,
+            minRadius=b_min,
+            maxRadius=b_max,
+        )
+        if hc is not None:
+            for cx, cy, rad in hc[0]:
+                add_cand(cx, cy, rad)
+
+    if not cand_grid:
         return []
 
-    # Extração de atributos usando metrics/features.py
-    # Se uma cratera tiver sombra escura (0 na máscara Otsu normal),
-    
-    craters = features.describe_craters(mask_clean, circles)
-    if len(craters) < circles.shape[1]:
-        mask_inv_clean = morphology.clean(mask_otsu == 0, kernel_size=5, iterations=1)
-        craters_inv = features.describe_craters(mask_inv_clean, circles)
-        if len(craters_inv) > len(craters):
-            craters = craters_inv
+    # 4. Avaliação Radial Vetorizada em NumPy para todos os candidatos de uma vez só
+    cands_arr = np.array(list(cand_grid.values()), dtype=np.float32)
+    cx_v, cy_v, r_v = cands_arr[:, 0:1], cands_arr[:, 1:2], cands_arr[:, 2:3]
 
-    return craters
+    angles = np.linspace(0, 2 * np.pi, 24, endpoint=False, dtype=np.float32)
+    cos_a, sin_a = np.cos(angles)[None, :], np.sin(angles)[None, :]
+    h, w = blur_f.shape
+
+    def sample_ring(factor: float):
+        xs = np.clip((cx_v + factor * r_v * cos_a).astype(np.int32), 0, w - 1)
+        ys = np.clip((cy_v + factor * r_v * sin_a).astype(np.int32), 0, h - 1)
+        return blur_f[ys, xs], grad[ys, xs]
+
+    v30, _ = sample_ring(0.30)
+    v55, _ = sample_ring(0.55)
+    v72, g72 = sample_ring(0.72)
+    v95, g95 = sample_ring(0.95)
+    v110, _ = sample_ring(1.10)
+
+    v_floor = 0.45 * v30 + 0.55 * v55
+    v_rim = 0.65 * v95 + 0.35 * v110
+    g_rim = np.maximum(g95, g72)
+
+    p15_floor = np.percentile(v_floor, 15, axis=1)
+    mean_floor = np.mean(v_floor, axis=1)
+    mean_72 = np.mean(v72, axis=1)
+    mean_rim = np.mean(v_rim, axis=1)
+    p85_rim = np.percentile(v_rim, 85, axis=1)
+    rim_jump_frac = np.mean((v_rim - v_floor) > 16.0, axis=1)
+    grad_score = np.mean(g_rim, axis=1)
+
+    # Trava o raio na transição exata entre o interior escuro (0.72r) e a crista clara (0.95r)
+    early_bright_pen = np.maximum(0.0, (mean_72 - mean_floor) - 0.55 * (mean_rim - mean_floor)) * 3.0
+    center_bright_pen = np.maximum(0.0, np.mean(v30, axis=1) - 90.0) * 2.0
+
+    scores = (
+        1.2 * (mean_rim - mean_floor)
+        + 0.6 * (p85_rim - p15_floor)
+        + 0.45 * grad_score
+        - 0.6 * p15_floor
+        - early_bright_pen
+        - center_bright_pen
+    ) * (rim_jump_frac ** 1.5)
+
+    # O controle PARAM2 (Exigência) ajusta o limiar de confiança e o limite de detecções
+    min_score_thresh = 55.0 + (param2_cfg - 20) * 1.8
+    max_detections = max(12, int(round(82 - param2_cfg)))
+
+    valid_mask = (
+        (p15_floor <= 72.0)
+        & (mean_floor <= 112.0)
+        & ((mean_rim - mean_floor) >= 22.0)
+        & (rim_jump_frac >= 0.55)
+        & (scores >= min_score_thresh)
+        & (r_v[:, 0] >= r_min_cfg)
+        & (r_v[:, 0] <= r_max_cfg)
+        & ~((cy_v[:, 0] > h - 38) & (cx_v[:, 0] > w * 0.35))
+    )
+
+    valid_idx = np.where(valid_mask)[0]
+    order = valid_idx[np.argsort(-scores[valid_idx])]
+
+    min_dist_factor = max(0.45, min(1.10, float(cfg["min_dist"]) / 33.0))
+    selected: list[tuple[int, int, int]] = []
+    for idx in order:
+        cx = int(round(cands_arr[idx, 0]))
+        cy = int(round(cands_arr[idx, 1]))
+        r = int(round(cands_arr[idx, 2]))
+        if not any(np.hypot(cx - ex, cy - ey) < min_dist_factor * max(r, er) for ex, ey, er in selected):
+            selected.append((cx, cy, r))
+        if len(selected) >= max_detections:
+            break
+
+    if not selected:
+        return []
+
+    # 5. Pós-refinamento de halo: se um círculo grande estiver envolvendo um cone escuro externo
+    # que já possui a crista branca da cratera menor bem definida no centro, trava no anel interno!
+    refined_work_circles: list[tuple[int, int, int]] = []
+    for cx, cy, r in selected:
+        best_r = r
+        if r >= 24:
+            for sub_f in (0.55, 0.62, 0.70, 0.78):
+                sr = int(round(r * sub_f))
+                if sr < r_min_cfg:
+                    continue
+                x_in = np.clip((cx + 0.45 * sr * cos_a[0]).astype(int), 0, w - 1)
+                y_in = np.clip((cy + 0.45 * sr * sin_a[0]).astype(int), 0, h - 1)
+                x_rm = np.clip((cx + 0.98 * sr * cos_a[0]).astype(int), 0, w - 1)
+                y_rm = np.clip((cy + 0.98 * sr * sin_a[0]).astype(int), 0, h - 1)
+                if blur_f[y_rm, x_rm].mean() - blur_f[y_in, x_in].mean() > 28.0 and blur_f[y_in, x_in].mean() < 85.0:
+                    best_r = sr
+                    break
+        refined_work_circles.append((cx, cy, best_r))
+
+    # 6. Constrói a máscara morfológica e extrai os atributos geométricos com metrics/features.py
+    mask_work = _build_cohesive_crater_mask(blur, refined_work_circles)
+    work_circles_arr = np.array(refined_work_circles, dtype=np.float32)
+    craters_work = features.describe_craters(mask_work, work_circles_arr)
+
+    min_circ = float(cfg.get("min_circularity", 0.35))
+    inv_scale = 1.0 / scale
+    results: list[dict] = []
+    for c in craters_work:
+        if c["circularity"] < min_circ:
+            continue
+        wx, wy = c["center"]
+        wr = c["radius"]
+        results.append({
+            "center": (int(round(wx * inv_scale)), int(round(wy * inv_scale))),
+            "radius": max(1, int(round(wr * inv_scale))),
+            "area": float(c["area"] * (inv_scale ** 2)),
+            "perimeter": float(c["perimeter"] * inv_scale),
+            "circularity": float(c["circularity"]),
+            "mask": c["mask"],
+        })
+
+    return results
 
 
 def draw_craters(gray: Image.Image, craters: list[dict]) -> Image.Image:
     """Desenha as crateras detectadas na imagem da Tela 2."""
     rgb = gray.convert("RGB")
     draw = ImageDraw.Draw(rgb)
+    w, h = rgb.size
+    line_w = max(2, int(round(max(w, h) / 400)))
     for i, c in enumerate(craters, start=1):
         x, y = c["center"]
         r = c["radius"]
-        draw.ellipse([x - r, y - r, x + r, y + r], outline=(255, 138, 61), width=2)
+        draw.ellipse([x - r, y - r, x + r, y + r], outline=(255, 138, 61), width=line_w)
         draw.text((x - 3, y - 5), str(i), fill=(54, 224, 255))
     return rgb
 
@@ -203,6 +416,8 @@ def draw_evaluation_comparison(
     """
     rgb = gray.convert("RGB")
     draw = ImageDraw.Draw(rgb)
+    w, h = rgb.size
+    line_w = max(2, int(round(max(w, h) / 400)))
 
     det_circles = eval_result["detected_circles"]
     gt_circles = eval_result["gt_circles"]
@@ -210,13 +425,13 @@ def draw_evaluation_comparison(
     # 1. Desenha as crateras ESQUECIDAS do gabarito (FN) em Azul Ciano
     for gt_idx in eval_result["unmatched_gt"]:
         x, y, r = gt_circles[gt_idx]
-        draw.ellipse([x - r, y - r, x + r, y + r], outline=(54, 224, 255), width=2)
+        draw.ellipse([x - r, y - r, x + r, y + r], outline=(54, 224, 255), width=line_w)
         draw.text((x - 8, y - r - 12), "FN", fill=(54, 224, 255))
 
     # 2. Desenha os FALSOS ALARMES (FP) em Vermelho
     for det_idx in eval_result["unmatched_detected"]:
         x, y, r = det_circles[det_idx]
-        draw.ellipse([x - r, y - r, x + r, y + r], outline=(255, 92, 119), width=2)
+        draw.ellipse([x - r, y - r, x + r, y + r], outline=(255, 92, 119), width=line_w)
         draw.text((x - 8, y - 6), "FP", fill=(255, 92, 119))
 
     # 3. Desenha os ACERTOS (TP) em Verde (e o gabarito correspondente em linha fina)
@@ -225,7 +440,7 @@ def draw_evaluation_comparison(
         draw.ellipse([gx - gr, gy - gr, gx + gr, gy + gr], outline=(180, 255, 210), width=1)
 
         dx, dy, dr = det_circles[det_idx]
-        draw.ellipse([dx - dr, dy - dr, dx + dr, dy + dr], outline=(61, 220, 132), width=3)
+        draw.ellipse([dx - dr, dy - dr, dx + dr, dy + dr], outline=(61, 220, 132), width=line_w + 1)
         draw.text((dx - 14, dy - 6), f"TP ({iou_val:.2f})", fill=(61, 220, 132))
 
     return rgb
@@ -238,7 +453,7 @@ def summarize(craters: list[dict], elapsed_ms: float, eval_result: dict | None =
         lines.append("MODO DEMO: dados de exemplo.\n")
 
     if len(craters) == 0:
-        lines.append("Nenhuma cratera encontrada.")
+        lines.append("Nenhuma cratera encontrada (tente diminuir o PARAM2 abaixo).")
     else:
         n = len(craters)
         biggest = max(craters, key=lambda c: c["radius"])
@@ -320,7 +535,7 @@ def ativar_botao(botao, ativo):
 
 
 def criar_botao(
-    parent, texto, comando, largura=180, altura=42, cor=CYAN, bg=BG, fonte=11
+    parent, texto, comando, largura=180, altura=42, cor=CYAN, bg=BG, fonte=10
 ):
     """Botão neon desenhado em Canvas. Devolve um dicionário (o 'botao')."""
     canvas = tk.Canvas(
@@ -439,8 +654,22 @@ def voar(speed):
 
 
 # ----------------------------------------------------------------------------
-# Tela 2: importar imagem, rodar pipeline real, exportar e avaliar
+# Tela 2: importar imagem, rodar pipeline real, ajustar parâmetros e avaliar
 # ----------------------------------------------------------------------------
+def ler_parametros_ui():
+    """Lê os controles de PARAM2, Raio Mín e Raio Máx da Tela 2, se existirem."""
+    if "var_param2" not in ui:
+        return dict(HOUGH_PARAMS)
+    try:
+        HOUGH_PARAMS["param2"] = max(10, int(ui["var_param2"].get()))
+        HOUGH_PARAMS["min_radius"] = max(6, int(ui["var_min_r"].get()))
+        HOUGH_PARAMS["max_radius"] = max(HOUGH_PARAMS["min_radius"] + 5, int(ui["var_max_r"].get()))
+        HOUGH_PARAMS["min_dist"] = max(8, int(ui["var_min_dist"].get()))
+    except (ValueError, tk.TclError):
+        pass
+    return dict(HOUGH_PARAMS)
+
+
 def importar_imagem():
     """Escolhe o arquivo, roda o pipeline real, mostra imagem e relatório."""
     path = filedialog.askopenfilename(
@@ -465,6 +694,8 @@ def importar_imagem():
     ativar_botao(ui["botao_salvar"], True)
     ativar_botao(ui["botao_exportar_csv"], True)
     ativar_botao(ui["botao_avaliar"], True)
+    if "botao_recalcular" in ui:
+        ativar_botao(ui["botao_recalcular"], True)
 
 
 def executar_deteccao():
@@ -472,7 +703,8 @@ def executar_deteccao():
     if estado["gray"] is None:
         return
 
-    craters, elapsed_ms = evaluation.timed(run_pipeline, estado["gray"], HOUGH_PARAMS)
+    cfg = ler_parametros_ui()
+    craters, elapsed_ms = evaluation.timed(run_pipeline, estado["gray"], cfg)
     estado["craters"] = craters
     estado["elapsed_ms"] = elapsed_ms
     estado["annotated"] = draw_craters(estado["gray"], craters)
@@ -568,7 +800,7 @@ def preencher_relatorio(craters, elapsed_ms, eval_result=None):
 def abrir_janela_avaliacao():
     """Abre uma janela dedicada que compara as detecções com o Ground Truth,
     mostra visualmente TP / FP / FN e responde se a Precisão e o Recall foram bons.
-    Também permite marcar crateras do gabarito clicando direto na imagem
+    Também permite marcar crateras do gabarito clicando direto na imagem!
     """
     if estado["gray"] is None:
         messagebox.showinfo("Aviso", "Importe uma imagem da Lua primeiro.")
@@ -576,8 +808,8 @@ def abrir_janela_avaliacao():
 
     win = tk.Toplevel(root)
     win.title("Avaliação com Ground Truth (Gabarito)")
-    win.geometry("1080x700")
-    win.minsize(920, 600)
+    win.geometry("1120x720")
+    win.minsize(960, 640)
     win.configure(bg=BG)
 
     win_state = {
@@ -587,7 +819,7 @@ def abrir_janela_avaliacao():
         "scale": 1.0,
         "offset_x": 0,
         "offset_y": 0,
-        "click_center": None,  # guarda o 1º clique (centro) ao marcar cratera manualmente
+        "click_center": None,
     }
 
     # Topo da janela
@@ -642,11 +874,11 @@ def abrir_janela_avaliacao():
         bg=PANEL,
         fg=CYAN,
         font=(FONT, 15, "bold"),
-    ).pack(anchor="w", padx=16, pady=(14, 6))
+    ).pack(anchor="w", padx=16, pady=(12, 6))
 
     # Card de veredito (diz se foi bom ou ruim)
     verdict_frame = tk.Frame(right, bg="#141936", highlightbackground=LINE, highlightthickness=1)
-    verdict_frame.pack(fill="x", padx=16, pady=(0, 12))
+    verdict_frame.pack(fill="x", padx=16, pady=(0, 10))
 
     lbl_verdict_title = tk.Label(
         verdict_frame,
@@ -656,7 +888,7 @@ def abrir_janela_avaliacao():
         font=(FONT, 13, "bold"),
         anchor="w",
     )
-    lbl_verdict_title.pack(fill="x", padx=12, pady=(10, 4))
+    lbl_verdict_title.pack(fill="x", padx=12, pady=(8, 4))
 
     lbl_verdict_msg = tk.Label(
         verdict_frame,
@@ -669,9 +901,9 @@ def abrir_janela_avaliacao():
         font=(FONT, 10),
         justify="left",
         anchor="w",
-        wraplength=360,
+        wraplength=370,
     )
-    lbl_verdict_msg.pack(fill="x", padx=12, pady=(0, 10))
+    lbl_verdict_msg.pack(fill="x", padx=12, pady=(0, 8))
 
     # Texto das métricas numéricas
     lbl_metrics = tk.Label(
@@ -679,16 +911,16 @@ def abrir_janela_avaliacao():
         text="",
         bg=PANEL,
         fg=TEXT,
-        font=(FONT, 11),
+        font=(FONT, 10),
         justify="left",
         anchor="w",
-        wraplength=360,
+        wraplength=370,
     )
-    lbl_metrics.pack(fill="x", padx=16, pady=(0, 10))
+    lbl_metrics.pack(fill="x", padx=16, pady=(0, 8))
 
     # Explicação rápida na própria janela para consulta
     help_box = tk.Frame(right, bg="#090c1c", highlightbackground=LINE, highlightthickness=1)
-    help_box.pack(fill="x", padx=16, pady=(4, 14), side="bottom")
+    help_box.pack(fill="x", padx=16, pady=(4, 12), side="bottom")
     tk.Label(
         help_box,
         text="O que significa cada métrica?",
@@ -696,22 +928,22 @@ def abrir_janela_avaliacao():
         fg=CYAN,
         font=(FONT, 10, "bold"),
         anchor="w",
-    ).pack(fill="x", padx=10, pady=(8, 2))
+    ).pack(fill="x", padx=10, pady=(6, 2))
     tk.Label(
         help_box,
         text=(
             "• Ground Truth (Gabarito): crateras reais marcadas por você.\n"
-            "• IoU (Interseção sobre União): % de sobreposição entre o círculo do programa e o real (>= 50% conta como acerto).\n"
-            "• Precisão: das crateras que o programa marcou, quantas eram reais? (cai se houver falsos alarmes vermelhos).\n"
-            "• Recall: das crateras reais que existem, quantas o programa achou? (cai se houver crateras azuis esquecidas)."
+            "• IoU (Interseção sobre União): % de encaixe entre o círculo detectado e o real.\n"
+            "• Precisão: das crateras marcadas pelo programa, quantas eram reais?\n"
+            "• Recall: das crateras reais que existem, quantas o programa achou?"
         ),
         bg="#090c1c",
         fg=MUTED,
         font=(FONT, 9),
         justify="left",
         anchor="w",
-        wraplength=360,
-    ).pack(fill="x", padx=10, pady=(0, 8))
+        wraplength=370,
+    ).pack(fill="x", padx=10, pady=(0, 6))
 
     def recalcular_e_desenhar():
         estado["ground_truth"] = list(win_state["gt_circles"])
@@ -735,7 +967,7 @@ def abrir_janela_avaliacao():
                 f"• Acertos (TP - Verde):        {res['tp']}\n"
                 f"• Falsos Alarmes (FP - Verm.): {res['fp']}\n"
                 f"• Esquecidas (FN - Azul):      {res['fn']}\n\n"
-                f"• Precisão (Precision):  {res['precision'] * 100:.1f}%\n"
+                f"• Precisão (Precision):   {res['precision'] * 100:.1f}%\n"
                 f"• Recall (Sensibilidade): {res['recall'] * 100:.1f}%\n"
                 f"• F1-Score (Equilíbrio):  {res['f1'] * 100:.1f}%\n"
                 f"• IoU Médio dos Acertos:  {res['mean_iou'] * 100:.1f}%\n"
@@ -761,10 +993,8 @@ def abrir_janela_avaliacao():
             )
             comp_img = draw_craters(estado["gray"], estado["craters"])
 
-        # Atualiza também o resumo da Tela 2 ao fundo
         preencher_relatorio(estado["craters"], estado["elapsed_ms"], estado["last_eval"])
 
-        # Renderiza no canvas da janela de avaliação
         canvas_cmp.delete("all")
         cw, ch = canvas_cmp.winfo_width(), canvas_cmp.winfo_height()
         if cw < 20 or ch < 20:
@@ -783,7 +1013,6 @@ def abrir_janela_avaliacao():
         win_state["photo"] = ImageTk.PhotoImage(resized)
         canvas_cmp.create_image(cw // 2, ch // 2, image=win_state["photo"])
 
-        # Se o usuário deu o 1º clique (centro), mostra um ponto amarelo provisório
         if win_state["click_center"] is not None:
             cx_img, cy_img = win_state["click_center"]
             sx = win_state["offset_x"] + cx_img * scale
@@ -791,7 +1020,6 @@ def abrir_janela_avaliacao():
             canvas_cmp.create_oval(sx - 4, sy - 4, sx + 4, sy + 4, fill="#ffe066", outline="#000")
 
     def ao_clicar_imagem(event):
-        """Permite criar/editar o Ground Truth clicando no centro e depois na borda."""
         scale = win_state["scale"]
         if scale <= 0:
             return
@@ -806,7 +1034,7 @@ def abrir_janela_avaliacao():
             recalcular_e_desenhar()
         else:
             cx, cy = win_state["click_center"]
-            r = int(round(math.hypot(ix - cx, iy - cy)))
+            r = int(round(float(np.hypot(ix - cx, iy - cy))))
             win_state["click_center"] = None
             if r >= 3:
                 win_state["gt_circles"].append((int(round(cx)), int(round(cy)), r))
@@ -852,13 +1080,13 @@ def abrir_janela_avaliacao():
         win_state["gt_circles"].clear()
         recalcular_e_desenhar()
 
-    btn_load = criar_botao(bar_gt, "Carregar CSV", carregar_gt_csv, largura=140, altura=36, cor=CYAN, bg=PANEL, fonte=10)
+    btn_load = criar_botao(bar_gt, "Carregar CSV", carregar_gt_csv, largura=135, altura=36, cor=CYAN, bg=PANEL, fonte=10)
     btn_load["canvas"].pack(side="left", padx=(0, 8))
 
-    btn_save = criar_botao(bar_gt, "Salvar Gabarito CSV", salvar_gt_csv, largura=165, altura=36, cor=GREEN, bg=PANEL, fonte=10)
+    btn_save = criar_botao(bar_gt, "Salvar Gabarito CSV", salvar_gt_csv, largura=160, altura=36, cor=GREEN, bg=PANEL, fonte=10)
     btn_save["canvas"].pack(side="left", padx=(0, 8))
 
-    btn_undo = criar_botao(bar_gt, "Desfazer marcação", desfazer_ultimo_gt, largura=155, altura=36, cor=ORANGE, bg=PANEL, fonte=10)
+    btn_undo = criar_botao(bar_gt, "Desfazer marcação", desfazer_ultimo_gt, largura=150, altura=36, cor=ORANGE, bg=PANEL, fonte=10)
     btn_undo["canvas"].pack(side="left", padx=(0, 8))
 
     btn_clear = criar_botao(bar_gt, "Limpar tudo", limpar_gt, largura=115, altura=36, cor=VIOLET, bg=PANEL, fonte=10)
@@ -884,7 +1112,7 @@ def criar_tela_inicial():
     )
 
     canvas.bind("<Configure>", desenhar_inicial)
-    canvas.bind("<Map>", desenhar_inicial)  # redesenha ao voltar para esta tela
+    canvas.bind("<Map>", desenhar_inicial)
     telas["inicial"] = frame
 
 
@@ -893,22 +1121,22 @@ def criar_tela_analise():
 
     # Topo: título + botão voltar
     top = tk.Frame(frame, bg=BG)
-    top.pack(fill="x", padx=24, pady=(18, 8))
+    top.pack(fill="x", padx=24, pady=(16, 6))
     tk.Label(
         top, text="Análise de imagem lunar", bg=BG, fg=TEXT, font=(FONT, 20, "bold")
     ).pack(side="left")
     botao_voltar = criar_botao(
-        top, "Voltar ao início", voltar_ao_inicio, largura=170, altura=38, cor=VIOLET, bg=BG
+        top, "Voltar ao início", voltar_ao_inicio, largura=160, altura=36, cor=VIOLET, bg=BG
     )
     botao_voltar["canvas"].pack(side="right")
 
     body = tk.Frame(frame, bg=BG)
-    body.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+    body.pack(fill="both", expand=True, padx=24, pady=(0, 16))
     body.columnconfigure(0, weight=3)
     body.columnconfigure(1, weight=2)
     body.rowconfigure(0, weight=1)
 
-    # Esquerda: imagem + botões
+    # Esquerda: imagem + barra de ajuste rápido + botões
     left = tk.Frame(body, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
     left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
 
@@ -917,30 +1145,56 @@ def criar_tela_analise():
     canvas.bind("<Configure>", lambda e: renderizar())
     ui["canvas_imagem"] = canvas
 
+    # Barra de ajuste fino (ajuda a adaptar para qualquer foto da Lua na hora)
+    tune_bar = tk.Frame(left, bg="#121633", highlightbackground=LINE, highlightthickness=1)
+    tune_bar.pack(fill="x", padx=12, pady=(0, 6))
+
+    tk.Label(tune_bar, text="Exigência (PARAM2):", bg="#121633", fg=MUTED, font=(FONT, 9, "bold")).pack(side="left", padx=(8, 4), pady=6)
+    ui["var_param2"] = tk.IntVar(value=HOUGH_PARAMS["param2"])
+    tk.Spinbox(tune_bar, from_=15, to=70, textvariable=ui["var_param2"], width=4, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat", font=(FONT, 10)).pack(side="left", padx=(0, 10))
+
+    tk.Label(tune_bar, text="Raio mín/máx:", bg="#121633", fg=MUTED, font=(FONT, 9, "bold")).pack(side="left", padx=(0, 4))
+    ui["var_min_r"] = tk.IntVar(value=HOUGH_PARAMS["min_radius"])
+    tk.Spinbox(tune_bar, from_=6, to=80, textvariable=ui["var_min_r"], width=3, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat", font=(FONT, 10)).pack(side="left", padx=(0, 4))
+    ui["var_max_r"] = tk.IntVar(value=HOUGH_PARAMS["max_radius"])
+    tk.Spinbox(tune_bar, from_=15, to=120, textvariable=ui["var_max_r"], width=4, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat", font=(FONT, 10)).pack(side="left", padx=(0, 10))
+
+    tk.Label(tune_bar, text="Dist. mín:", bg="#121633", fg=MUTED, font=(FONT, 9, "bold")).pack(side="left", padx=(0, 4))
+    ui["var_min_dist"] = tk.IntVar(value=HOUGH_PARAMS["min_dist"])
+    tk.Spinbox(tune_bar, from_=10, to=90, textvariable=ui["var_min_dist"], width=4, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat", font=(FONT, 10)).pack(side="left", padx=(0, 8))
+
+    botao_recalcular = criar_botao(
+        tune_bar, "Recalcular", executar_deteccao, largura=105, altura=30, cor=CYAN, bg="#121633", fonte=9
+    )
+    botao_recalcular["canvas"].pack(side="right", padx=8, pady=4)
+    ativar_botao(botao_recalcular, False)
+    ui["botao_recalcular"] = botao_recalcular
+
+    # Botões de ação
     bar = tk.Frame(left, bg=PANEL)
-    bar.pack(fill="x", padx=12, pady=(6, 12))
+    bar.pack(fill="x", padx=12, pady=(2, 10))
 
     botao_importar = criar_botao(
-        bar, "Importar imagem", importar_imagem, largura=155, altura=40, cor=CYAN, bg=PANEL
+        bar, "Importar imagem", importar_imagem, largura=138, altura=38, cor=CYAN, bg=PANEL, fonte=10
     )
     botao_importar["canvas"].pack(side="left")
 
     botao_salvar = criar_botao(
-        bar, "Salvar imagem", salvar_imagem, largura=140, altura=40, cor=ORANGE, bg=PANEL
+        bar, "Salvar imagem", salvar_imagem, largura=125, altura=38, cor=ORANGE, bg=PANEL, fonte=10
     )
-    botao_salvar["canvas"].pack(side="left", padx=8)
+    botao_salvar["canvas"].pack(side="left", padx=6)
     ativar_botao(botao_salvar, False)
     ui["botao_salvar"] = botao_salvar
 
     botao_exportar_csv = criar_botao(
-        bar, "Exportar CSV", exportar_csv_crateras, largura=135, altura=40, cor=VIOLET, bg=PANEL
+        bar, "Exportar CSV", exportar_csv_crateras, largura=120, altura=38, cor=VIOLET, bg=PANEL, fonte=10
     )
-    botao_exportar_csv["canvas"].pack(side="left", padx=(0, 8))
+    botao_exportar_csv["canvas"].pack(side="left", padx=(0, 6))
     ativar_botao(botao_exportar_csv, False)
     ui["botao_exportar_csv"] = botao_exportar_csv
 
     botao_avaliar = criar_botao(
-        bar, "Avaliar (Ground Truth)", abrir_janela_avaliacao, largura=195, altura=40, cor=GREEN, bg=PANEL
+        bar, "Avaliar (Ground Truth)", abrir_janela_avaliacao, largura=172, altura=38, cor=GREEN, bg=PANEL, fonte=10
     )
     botao_avaliar["canvas"].pack(side="left")
     ativar_botao(botao_avaliar, False)
@@ -1035,8 +1289,8 @@ def main():
     global root
     root = tk.Tk()
     root.title(APP_NAME)
-    root.geometry("1140x680")
-    root.minsize(960, 600)
+    root.geometry("1160x700")
+    root.minsize(980, 620)
     root.configure(bg=BG)
 
     configurar_estilo()
