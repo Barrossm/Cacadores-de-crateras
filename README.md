@@ -100,9 +100,9 @@ Para testar, coloque imagens em `Imagens_entrada/`. De onde vieram e como foi fe
 
 - [x] Estrutura do repositório
 - [x] `preprocessing/acquisition.py`: leitura e conversão para escala de cinza
-- [ ] `preprocessing/contrast.py`: CLAHE
-- [ ] `preprocessing/smoothing.py`: filtro Gaussiano
-- [ ] `preprocessing/edges.py`: Sobel e Laplaciano
+- [x] `preprocessing/contrast.py`: CLAHE
+- [x] `preprocessing/smoothing.py`: filtro Gaussiano
+- [x] `preprocessing/edges.py`: Sobel e Laplaciano
 - [x] `segmentation/morphology.py`: abertura e fechamento
 - [x] `segmentation/otsu_hough.py`: Otsu + Hough
 - [ ] `metrics/features.py`: descrição geométrica das crateras
