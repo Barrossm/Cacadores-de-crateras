@@ -105,10 +105,10 @@ Para testar, coloque imagens em `Imagens_entrada/`. De onde vieram e como foi fe
 - [x] `preprocessing/edges.py`: Sobel e Laplaciano
 - [x] `segmentation/morphology.py`: abertura e fechamento
 - [x] `segmentation/otsu_hough.py`: Otsu + Hough
-- [ ] `metrics/features.py`: descrição geométrica das crateras
-- [ ] `metrics/evaluation.py`: IoU, precisão, recall e tempo
-- [ ] `gui.py`: interface gráfica
-- [ ] Ground truth e experimentos
+- [X] `metrics/features.py`: descrição geométrica das crateras
+- [X] `metrics/evaluation.py`: IoU, precisão, recall e tempo
+- [X] `gui.py`: interface gráfica
+- [X] Ground truth e experimentos
 - [ ] Relatório e vídeo de apresentação
 
 ## Referências
