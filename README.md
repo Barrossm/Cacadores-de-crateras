@@ -6,7 +6,7 @@ Projeto da 2ª VA da disciplina **Processamento de Imagens** (PI 2026.2), UFRPE,
 
 **Integrantes:** Gabriel Barros de Morais, Elton da Costa Oliveira e Júlia Karolyne Falcão Diniz Oliveira.
 
-> **Status:** 🚧 em desenvolvimento. A seção [Roadmap](#roadmap) mostra o que já está pronto.
+> **Status:** Finalizado!
 
 ---
 
@@ -109,7 +109,6 @@ Para testar, coloque imagens em `Imagens_entrada/`. De onde vieram e como foi fe
 - [X] `metrics/evaluation.py`: IoU, precisão, recall e tempo
 - [X] `gui.py`: interface gráfica
 - [X] Ground truth e experimentos
-- [ ] Relatório e vídeo de apresentação
 
 ## Referências
 
