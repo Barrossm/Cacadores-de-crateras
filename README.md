@@ -6,7 +6,7 @@ Projeto da 2ª VA da disciplina **Processamento de Imagens** (PI 2026.2), UFRPE,
 
 **Integrantes:** Gabriel Barros de Morais, Elton da Costa Oliveira e Júlia Karolyne Falcão Diniz Oliveira.
 
-> **Status:** Finalizado!
+> **Status:** Finalizado! 🚀
 
 ---
 
