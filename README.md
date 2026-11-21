@@ -92,9 +92,10 @@ Para testar, coloque imagens em `Imagens_entrada/`. De onde vieram e como foi fe
 
 | Cenário                      | IoU | Precisão | Recall | Tempo/recorte |
 | ---------------------------- | --- | -------- | ------ | ------------- |
-| Crateras isoladas            |     |          |        |               |
-| Muitas crateras              |     |          |        |               |
-| Terreno rugoso / luz rasante |     |          |        |               |
+| Crateras isoladas            |64 % |   71 %   |  67 %  |     1,3 s     |
+| Muitas crateras              |61 % |   74 %   |  67 %  |     1,6 s     |
+| Terreno rugoso / luz rasante |66 % |   44 %   |  48 %  |     1,6 s     |
+| Terreno com maior iluminação |63 % |   96 %   |  72 %  |     3,3 s     |
 
 ## Roadmap
 
