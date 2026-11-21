@@ -74,6 +74,7 @@ pip install -r requirements.txt
 
 ## Como usar
 
+Rode o seguinte arquivo
 ```bash
 python gui.py
 ```
